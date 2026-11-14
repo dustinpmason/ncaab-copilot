@@ -26,9 +26,9 @@ import statistics
 import sys
 from statistics import NormalDist
 
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 ND = NormalDist()
-BETTABLE = "draftkings,fanduel,betmgm"
+BETTABLE = "draftkings,fanduel,betmgm,betonlineag"
 
 # ----------------------------------------------------------------- odds math
 
@@ -248,15 +248,23 @@ def parse_fanmatch(text):
 # ------------------------------------------------------------- slate command
 
 
-def _two_way_novig(outcomes):
-    if len(outcomes) != 2 or any(o.get("price") is None for o in outcomes):
-        return None
-    a, b = implied(outcomes[0]["price"]), implied(outcomes[1]["price"])
-    return {outcomes[0]["name"]: a / (a + b), outcomes[1]["name"]: b / (a + b)}
+def _side_of(o, ev):
+    """Which side an outcome is: the book's own `side` field, else a strict name match."""
+    sd = (o.get("side") or "").lower()
+    if sd in ("home", "away"):
+        return sd
+    name = o.get("name") or ""
+    h, w = team_sim(name, ev["home_team"]), team_sim(name, ev["away_team"])
+    if max(h, w) >= 0.85 and h != w:
+        return "home" if h > w else "away"
+    return None
 
 
 def _event_lines(ev):
-    """Per book: main moneyline and main spread for an event."""
+    """Per book: main moneyline and main spread, keyed by side ('home'/'away').
+
+    Books spell teams differently from the event ("Gonzaga Bulldogs", "NC State Wolfpack"),
+    so outcomes are pinned by side, never by name."""
     out = {}
     for b in ev.get("bookmakers") or []:
         if ev.get("live") and b.get("pregame_only"):
@@ -265,14 +273,19 @@ def _event_lines(ev):
         for m in b.get("markets") or []:
             if m.get("suspended_at") or m.get("line_type") not in (None, "main") or m.get("period"):
                 continue
+            if m["key"] not in ("h2h", "spreads") or len(m.get("outcomes") or []) != 2:
+                continue
+            sides = [_side_of(o, ev) for o in m["outcomes"]]
+            if set(sides) != {"home", "away"} or any(o.get("price") is None for o in m["outcomes"]):
+                continue
+            by = dict(zip(sides, m["outcomes"]))
             if m["key"] == "h2h" and "ml" not in rec:
-                nv = _two_way_novig(m["outcomes"])
-                if nv:
-                    rec["ml"] = {o["name"]: o["price"] for o in m["outcomes"]}
-                    rec["nv"] = nv
+                x, y = implied(by["home"]["price"]), implied(by["away"]["price"])
+                rec["ml"] = {k: by[k]["price"] for k in by}
+                rec["nv"] = {"home": x / (x + y), "away": y / (x + y)}
             elif m["key"] == "spreads" and "sp" not in rec:
-                if all(o.get("point") is not None and o.get("price") is not None for o in m["outcomes"]):
-                    rec["sp"] = {o["name"]: (o["point"], o["price"]) for o in m["outcomes"]}
+                if all(o.get("point") is not None for o in m["outcomes"]):
+                    rec["sp"] = {k: (by[k]["point"], by[k]["price"]) for k in by}
         if rec:
             out[b["key"]] = rec
     return out
@@ -303,7 +316,8 @@ def match_games(games, events, extra=None, threshold=0.8):
         ev, swapped = best[2], best[3]
         names = {g["away"]: ev["home_team"] if swapped else ev["away_team"],
                  g["home"]: ev["away_team"] if swapped else ev["home_team"]}
-        matched.append((g, ev, names))
+        sides = {g["away"]: "home" if swapped else "away", g["home"]: "away" if swapped else "home"}
+        matched.append((g, ev, names, sides))
     return matched, unmatched
 
 
@@ -311,9 +325,9 @@ def build_board(games, events, books=BETTABLE, kp_weight=0.5, extra=None):
     books = [b.strip() for b in books.split(",") if b.strip()]
     matched, unmatched = match_games(games, events, extra)
     rows = []
-    for g, ev, names in matched:
+    for g, ev, names, sides in matched:
         lines = _event_lines(ev)
-        w = names[g["winner"]]
+        w = sides[g["winner"]]
         kp_margin = g["sw"] - g["sl"]
         nv = [r["nv"][w] for r in lines.values() if "nv" in r and w in r["nv"]]
         sp = [r["sp"][w][0] for r in lines.values() if "sp" in r and w in r["sp"]]
@@ -335,7 +349,7 @@ def build_board(games, events, books=BETTABLE, kp_weight=0.5, extra=None):
         blend = kp_weight * g["p"] + (1 - kp_weight) * mk_p if mk_p is not None else None
         row = dict(
             game=f"{g['away']} {'vs' if g['neutral'] else '@'} {g['home']}", event_id=ev["id"],
-            kp_pick=g["winner"], propline_name=w, kp_score=f"{g['sw']}-{g['sl']}", kp_margin=kp_margin,
+            kp_pick=g["winner"], propline_name=names[g["winner"]], side=w, kp_score=f"{g['sw']}-{g['sl']}", kp_margin=kp_margin,
             kp_p=g["p"], mk_p=mk_p, ml_books=len(nv), edge_pp=None if mk_p is None else 100 * (g["p"] - mk_p),
             blend_p=blend, mk_spread=mk_sp, spread_edge=None if mk_sp is None else kp_margin + mk_sp,
             best_ml=best_ml, best_spread=best_sp, live=bool(ev.get("live")), commence=ev.get("commence_time"),
@@ -834,6 +848,17 @@ def cmd_selftest(_):
     check("names: mascot stripped", team_sim("Bryant", "Bryant Bulldogs") >= 0.85)
     check("names: North Carolina != North Carolina Central",
           team_sim("North Carolina", "North Carolina Central") < 0.8)
+    ev = dict(id="1", home_team="Gonzaga", away_team="LSU", live=False, bookmakers=[
+        dict(key="polymarket", markets=[dict(key="h2h", line_type="main", outcomes=[
+            dict(name="Gonzaga Bulldogs", price=-223, side="home"), dict(name="LSU Tigers", price=212, side="away")])]),
+        dict(key="fanduel", markets=[dict(key="h2h", line_type="main", outcomes=[
+            dict(name="Gonzaga", price=-220, side="home"), dict(name="LSU", price=180, side="away")]),
+            dict(key="spreads", line_type="main", outcomes=[
+            dict(name="Gonzaga Bulldogs", price=-110, point=-5.5), dict(name="LSU Tigers", price=-110, point=5.5)])])])
+    rows, un = build_board([dict(away="LSU", home="Gonzaga", winner="Gonzaga", sw=82, sl=75, p=0.73, neutral=False,
+                                 tempo=70)], [ev])
+    check("board: prices read by side when a book adds the mascot",
+          not un and rows[0]["ml_books"] == 2 and rows[0]["best_ml"] == (-220, "fanduel") and rows[0]["mk_spread"] == -5.5)
     check("players: 'Dixon, Derek' = 'Derek Dixon'", same_player("Dixon, Derek", "Derek Dixon"))
     check("players: Neo = Neoklis Avdalas (UNC)", same_player("Neo Avdalas", "Neoklis Avdalas (UNC)"))
     k, n, imp, est = rung_estimate([6, 7, 7], 6, -230)
@@ -911,7 +936,18 @@ def main():
 
     sub.add_parser("selftest", help="run built-in checks").set_defaults(fn=cmd_selftest)
 
-    a = ap.parse_args()
+    # A value such as "-155:0.61:NKU" starts with a dash, and argparse would read it as an option.
+    # Join each of these flags to its value so any odds or line is accepted as written.
+    joined = {"--leg", "--book", "--min-odds", "--closing", "--legs", "--spread", "--hist", "--alias", "--ticket"}
+    argv, raw, i = [], sys.argv[1:], 0
+    while i < len(raw):
+        if raw[i] in joined and i + 1 < len(raw):
+            argv.append(raw[i] + "=" + raw[i + 1])
+            i += 2
+        else:
+            argv.append(raw[i])
+            i += 1
+    a = ap.parse_args(argv)
     a.fn(a)
 
 

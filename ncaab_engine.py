@@ -4,6 +4,7 @@
 One file, standard library only. Subcommands:
 
   slate     KenPom FanMatch text + PropLine bulk odds  -> edge board for every game
+  build     edge board (+ promo rules)                 -> the best slips, labeled EDGE / FAIR / OVERRIDE
   ladder    PropLine event odds + player game logs     -> overs-only alt-line board
   cover     KenPom margin + win% + spread              -> cover probability
   parlay    legs (+ book price, boost, bonus bet)      -> price, book tax, cash chance, EV
@@ -26,7 +27,7 @@ import statistics
 import sys
 from statistics import NormalDist
 
-VERSION = "2.0.1"
+VERSION = "2.1.0"
 ND = NormalDist()
 BETTABLE = "draftkings,fanduel,betmgm,betonlineag"
 
@@ -321,44 +322,77 @@ def match_games(games, events, extra=None, threshold=0.8):
     return matched, unmatched
 
 
-def build_board(games, events, books=BETTABLE, kp_weight=0.5, extra=None):
+KP_NUDGE_UP, KP_NUDGE_DOWN = 0.02, 0.03
+
+
+def working_prob(kp_p, mk_p, kp_weight):
+    """The market's no-vig probability, nudged toward KenPom by at most +2 / -3 points.
+
+    The market is the anchor. The shortlist is built from games where KenPom is most
+    optimistic, so an uncapped blend overstates every leg picked (seen on 14 Nov, when the
+    copilot's legs ran 2 to 8 points above the sharp closing line)."""
+    return mk_p + max(-KP_NUDGE_DOWN, min(KP_NUDGE_UP, kp_weight * (kp_p - mk_p)))
+
+
+def teams_in_fanmatch(text):
+    """Normalized names of every team on a FanMatch page, finished games included."""
+    games, _ = parse_fanmatch(text)
+    names = {g["away"] for g in games} | {g["home"] for g in games}
+    lines = text.splitlines()
+    for i, line in enumerate(lines[:-1]):
+        m1 = re.match(r"^\s*(?:\d+|NR)\s+(.+?)\s+(\d+),\s*$", line)
+        m2 = re.match(r"^\s*(?:\d+|NR)\s+(.+?)\s+(\d+)\s*(?:\[\d+\])?", lines[i + 1])
+        if m1 and m2:
+            names |= {m1[1], m2[1]}
+    return {norm_team(n) for n in names}
+
+
+def build_board(games, events, books=BETTABLE, kp_weight=0.5, extra=None, played_yesterday=None):
     books = [b.strip() for b in books.split(",") if b.strip()]
+    played_yesterday = played_yesterday or set()
     matched, unmatched = match_games(games, events, extra)
     rows = []
     for g, ev, names, sides in matched:
         lines = _event_lines(ev)
-        w = sides[g["winner"]]
-        kp_margin = g["sw"] - g["sl"]
-        nv = [r["nv"][w] for r in lines.values() if "nv" in r and w in r["nv"]]
-        sp = [r["sp"][w][0] for r in lines.values() if "sp" in r and w in r["sp"]]
-        mk_p = statistics.median(nv) if nv else None
+        pick_side = sides[g["winner"]]
+        loser = g["home"] if g["winner"] == g["away"] else g["away"]
+        nv = [r["nv"][pick_side] for r in lines.values() if "nv" in r]
+        mk_pick = statistics.median(nv) if nv else None
+        # The play is the side with the higher working probability, which is not always KenPom's pick.
+        play, opp, side, kp_p, kp_margin, flipped = g["winner"], loser, pick_side, g["p"], g["sw"] - g["sl"], False
+        if mk_pick is not None and (working_prob(1 - g["p"], 1 - mk_pick, kp_weight)
+                                    > working_prob(g["p"], mk_pick, kp_weight)):
+            play, opp, side, flipped = loser, g["winner"], ("away" if pick_side == "home" else "home"), True
+            kp_p, kp_margin = 1 - g["p"], -(g["sw"] - g["sl"])
+        mk_p = None if mk_pick is None else (1 - mk_pick if flipped else mk_pick)
+        work = None if mk_p is None else working_prob(kp_p, mk_p, kp_weight)
+        sp = [r["sp"][side][0] for r in lines.values() if "sp" in r]
         mk_sp = statistics.median(sp) if sp else None
+        prices = {b: r["ml"][side] for b, r in lines.items() if "ml" in r}
         best_ml = None
         for b in books:
-            r = lines.get(b)
-            if r and "ml" in r and w in r["ml"]:
-                if best_ml is None or dec(r["ml"][w]) > dec(best_ml[0]):
-                    best_ml = (r["ml"][w], b)
+            if b in prices and (best_ml is None or dec(prices[b]) > dec(best_ml[0])):
+                best_ml = (prices[b], b)
         best_sp = None
         for b in books:
             r = lines.get(b)
-            if r and "sp" in r and w in r["sp"]:
-                pt, pr = r["sp"][w]
+            if r and "sp" in r:
+                pt, pr = r["sp"][side]
                 if best_sp is None or (pt, dec(pr)) > (best_sp[0], dec(best_sp[1])):
                     best_sp = (pt, pr, b)
-        blend = kp_weight * g["p"] + (1 - kp_weight) * mk_p if mk_p is not None else None
         row = dict(
             game=f"{g['away']} {'vs' if g['neutral'] else '@'} {g['home']}", event_id=ev["id"],
-            kp_pick=g["winner"], propline_name=names[g["winner"]], side=w, kp_score=f"{g['sw']}-{g['sl']}", kp_margin=kp_margin,
-            kp_p=g["p"], mk_p=mk_p, ml_books=len(nv), edge_pp=None if mk_p is None else 100 * (g["p"] - mk_p),
-            blend_p=blend, mk_spread=mk_sp, spread_edge=None if mk_sp is None else kp_margin + mk_sp,
-            best_ml=best_ml, best_spread=best_sp, live=bool(ev.get("live")), commence=ev.get("commence_time"),
-            flags=[],
+            play=play, opponent=opp, propline_name=names[play], side=side, kp_pick=g["winner"],
+            kp_score=f"{g['sw']}-{g['sl']}", kp_margin=kp_margin, kp_p=kp_p, mk_p=mk_p, ml_books=len(nv),
+            edge_pp=None if mk_p is None else 100 * (kp_p - mk_p), work_p=work, mk_spread=mk_sp,
+            spread_edge=None if mk_sp is None else kp_margin + mk_sp, prices=prices, best_ml=best_ml,
+            best_spread=best_sp, live=bool(ev.get("live")), commence=ev.get("commence_time"), flags=[],
         )
-        if best_ml and blend is not None:
-            row["ml_ev"] = blend * dec(best_ml[0]) - 1
+        if best_ml and work is not None:
+            row["mkt_ev"] = mk_p * dec(best_ml[0]) - 1
+            row["work_ev"] = work * dec(best_ml[0]) - 1
         if best_sp:
-            cp, sd = cover_prob(kp_margin, g["p"], best_sp[0])
+            cp, sd = cover_prob(kp_margin, kp_p, best_sp[0])
             row["kp_cover"] = cp
             row["blend_cover"] = kp_weight * cp + (1 - kp_weight) * 0.5
         f = row["flags"]
@@ -367,19 +401,48 @@ def build_board(games, events, books=BETTABLE, kp_weight=0.5, extra=None):
         if mk_p is None:
             f.append("NO-ML")
         else:
-            if mk_p < 0.5:
-                f.append("KP-VS-MKT")
             if best_ml and best_ml[0] < -400:
                 f.append("CHALK")
-            elif best_ml and blend >= 0.60 and row["edge_pp"] >= 2 and not row["live"]:
+            elif best_ml and work >= 0.60 and not row["live"]:
                 f.append("ANCHOR")
-        if row.get("ml_ev", -1) >= 0 and not row["live"]:
-            f.append("EV+")
+            if row.get("mkt_ev", -1) >= 0 and not row["live"]:
+                f.append("VALUE")
+            if flipped or mk_pick < 0.5:
+                f.append("KP-VS-MKT")
+            elif row["edge_pp"] >= 2:
+                f.append("KP+")
+            elif row["edge_pp"] <= -5:
+                f.append("KP-")
         if mk_sp is not None and -8.5 <= mk_sp <= -6.5:
             f.append("LEAK-BAND")
+        if g["neutral"]:
+            f.append("NEUTRAL")
+        elif sides[g["home"]] == "away":
+            f.append("SITE?")
+        if norm_team(play, extra) in played_yesterday:
+            f.append("B2B")
+        if norm_team(opp, extra) in played_yesterday:
+            f.append("OPP-B2B")
         rows.append(row)
-    rows.sort(key=lambda r: (r["live"], -(r["edge_pp"] if r["edge_pp"] is not None else -99)))
+    rows.sort(key=lambda r: (r["live"], r.get("work_ev") is None, -(r.get("work_ev") or 0)))
     return rows, unmatched
+
+
+def et_time(iso):
+    """'2026-11-14T20:30:00Z' -> (minutes after midnight ET, '3:30 PM')."""
+    if not iso:
+        return None, ""
+    import datetime
+    try:
+        t = datetime.datetime.strptime(iso[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None, ""
+    try:
+        from zoneinfo import ZoneInfo
+        t = t.astimezone(ZoneInfo("America/New_York"))
+    except Exception:
+        t = t.astimezone(datetime.timezone(datetime.timedelta(hours=-5)))
+    return t.hour * 60 + t.minute, t.strftime("%I:%M %p").lstrip("0")
 
 
 def cmd_slate(a):
@@ -392,13 +455,18 @@ def cmd_slate(a):
     for al in a.alias or []:
         k, v = al.split("=", 1)
         extra[norm_team(k)] = norm_team(v)
-    rows, unmatched = build_board(games, events, a.books, a.kp_weight, extra)
+    prev = set()
+    if a.prev_fanmatch:
+        prev = teams_in_fanmatch(open(a.prev_fanmatch, encoding="utf-8", errors="replace").read())
+    rows, unmatched = build_board(games, events, a.books, a.kp_weight, extra, prev)
     print(f"NCAAB edge board  |  KenPom games parsed: {len(games)}  matched to odds: {len(rows)}  "
-          f"unmatched: {len(unmatched)}  unparsed lines: {len(bad)}  |  KenPom weight in blend: {a.kp_weight}")
-    hdr = f"{'Game':38} {'KenPom pick':20} {'KP':>7} {'KP%':>5} {'Mkt%':>5} {'Edge':>6} {'Blend':>6} " \
-          f"{'Sprd':>6} {'SpEdge':>6} {'Best ML':>14} {'ML EV':>6}  Flags"
+          f"unmatched: {len(unmatched)}  unparsed lines: {len(bad)}  |  KenPom weight: {a.kp_weight}"
+          + ("" if a.prev_fanmatch else "  |  no --prev-fanmatch given, so rest is NOT checked"))
+    hdr = f"{'Game':36} {'Play':19} {'Tip ET':>8} {'KP%':>4} {'Mkt%':>4} {'Edge':>6} {'Work':>5} " \
+          f"{'Best ML':>15} {'MktEV':>6} {'WkEV':>6} {'Sprd':>6}  Flags"
     print(hdr)
     print("-" * len(hdr))
+
     def cell(v, fmt, suffix=""):
         return "" if v is None else format(v, fmt) + suffix
 
@@ -407,24 +475,29 @@ def cmd_slate(a):
         if r["live"] and not a.include_live:
             hidden_live += 1
             continue
+        if a.min_work is not None and (r["work_p"] is None or 100 * r["work_p"] < a.min_work):
+            continue
         if a.min_edge is not None and (r["edge_pp"] is None or r["edge_pp"] < a.min_edge):
             continue
-        bm = fmt_am(r["best_ml"][0]) + " " + r["best_ml"][1][:9] if r["best_ml"] else "n/a"
+        bm = fmt_am(r["best_ml"][0]) + " " + r["best_ml"][1][:10] if r["best_ml"] else "n/a"
         cols = [
-            r["game"][:38].ljust(38), r["kp_pick"][:20].ljust(20), r["kp_score"].rjust(7),
-            cell(100 * r["kp_p"], ".0f").rjust(5),
-            cell(None if r["mk_p"] is None else 100 * r["mk_p"], ".0f").rjust(5),
+            r["game"][:36].ljust(36), r["play"][:19].ljust(19), et_time(r["commence"])[1].rjust(8),
+            cell(100 * r["kp_p"], ".0f").rjust(4),
+            cell(None if r["mk_p"] is None else 100 * r["mk_p"], ".0f").rjust(4),
             cell(r["edge_pp"], "+.1f").rjust(6),
-            cell(None if r["blend_p"] is None else 100 * r["blend_p"], ".0f", "%").rjust(6),
-            cell(r["mk_spread"], "+.1f").rjust(6), cell(r["spread_edge"], "+.1f").rjust(6), bm.rjust(14),
-            cell(100 * r["ml_ev"] if "ml_ev" in r else None, "+.1f", "%").rjust(6), " " + ",".join(r["flags"]),
+            cell(None if r["work_p"] is None else 100 * r["work_p"], ".0f", "%").rjust(5), bm.rjust(15),
+            cell(100 * r["mkt_ev"] if "mkt_ev" in r else None, "+.1f", "%").rjust(6),
+            cell(100 * r["work_ev"] if "work_ev" in r else None, "+.1f", "%").rjust(6),
+            cell(r["mk_spread"], "+.1f").rjust(6), " " + ",".join(r["flags"]),
         ]
         print(" ".join(cols))
     if hidden_live:
         print(f"\n{hidden_live} games already in progress are hidden (their odds are in-play, so a pregame "
               "comparison would be wrong). Pass --include-live to list them.")
-    print("\nEdge = KenPom win% minus the market's no-vig win% for KenPom's pick (median across books). "
-          "Blend = the working win probability. SpEdge = KenPom margin minus the market spread, in points.")
+    print("\nPlay = the side with the higher working probability. Mkt% = the market's no-vig win probability "
+          "(median across books). Edge = KenPom minus market, in points. Work = the market, nudged toward "
+          "KenPom by at most +2 / -3 points. MktEV = best price against the market's fair number; WkEV = "
+          "against Work.")
     if unmatched:
         print("\nUNMATCHED (not guessed - resolve by hand or pass --alias 'KenPom name=PropLine name'):")
         for g, why in unmatched:
@@ -436,6 +509,150 @@ def cmd_slate(a):
     if a.json:
         json.dump(rows, open(a.json, "w"), indent=1, default=str)
         print(f"\nBoard saved to {a.json}")
+
+
+# ------------------------------------------------------------- build command
+
+
+def _hhmm(s):
+    h, m = s.split(":")
+    return int(h) * 60 + int(m)
+
+
+def find_slips(rows, books, min_legs, max_legs, min_prob, min_odds, boost, stake, bonus, top, overlap,
+               max_candidates=28, worst_leg=-400):
+    """Every qualifying single-book slip, best chance to cash first. Returns a list of dicts."""
+    cands = [r for r in rows if r.get("work_p") is not None and r["work_p"] >= min_prob]
+    cands.sort(key=lambda r: -r["work_p"])
+    cands = cands[:max_candidates]
+    priced_books = {b for r in rows for b in (r.get("prices") or {})}
+    if any(b in priced_books for b in books):          # reference pricing only when no carried book was asked for
+        books = [b for b in books if b in priced_books]
+    need = dec(parse_american(min_odds)) if min_odds else None
+    out = []
+    import itertools
+    for b in books:
+        ref = b not in priced_books                     # a book PropLine does not carry: use best-of prices
+        legs_b = []
+        for r in cands:
+            if ref:
+                pr = r["best_ml"][0] if r.get("best_ml") else None
+            else:
+                pr = (r.get("prices") or {}).get(b)
+            if pr is not None and pr >= worst_leg:
+                legs_b.append((r, pr))
+        for n in range(min_legs, max_legs + 1):
+            for combo in itertools.combinations(legs_b, n):
+                d = math.prod(dec(pr) for _, pr in combo)
+                if need and d < need - 1e-9:
+                    continue
+                cash = math.prod(r["work_p"] for r, _ in combo)
+                mcash = math.prod(r["mk_p"] for r, _ in combo)
+                profit = stake * (d - 1) * (1 + boost)
+                ev = cash * profit if bonus else cash * profit - (1 - cash) * stake
+                mev = mcash * profit if bonus else mcash * profit - (1 - mcash) * stake
+                out.append(dict(book=b, ref=ref, legs=combo, dec=d, cash=cash, profit=profit, ev=ev, mcash=mcash, mev=mev,
+                                breakeven=None if bonus else stake / (stake + profit)))
+    out.sort(key=lambda s: (-s["cash"], -s["ev"]))
+    picked, used = [], set()
+    for s in out:
+        games = {r["game"] for r, _ in s["legs"]}
+        if not overlap and games & used:
+            continue
+        picked.append(s)
+        used |= games
+        if len(picked) >= top:
+            break
+    return picked
+
+
+def print_slip(i, s, label, stake, boost, bonus, why=""):
+    d = s["dec"]
+    price = fmt_am(american(d))
+    boosted = f" -> boosted {fmt_am(american(1 + (d - 1) * (1 + boost)))}" if boost else ""
+    book = s["book"] + (" (reference prices: best of the books PropLine carries)" if s["ref"] else "")
+    be = "" if s["breakeven"] is None else f" (break-even {pct(s['breakeven'])})"
+    back = s["profit"] if bonus else s["profit"] + stake
+    print(f"\n#{i}  {label}  |  {book}  |  {price}{boosted}  |  ${stake:g} returns ${back:.2f}")
+    print(f"    Chance to cash: {pct(s['mcash'])} at the market's probabilities, {pct(s['cash'])} at working "
+          f"probabilities{be}")
+    print(f"    EV: ${s['mev']:+.2f} ({s['mev'] / stake:+.0%}) at the market's probabilities, "
+          f"${s['ev']:+.2f} ({s['ev'] / stake:+.0%}) at working probabilities")
+    if why:
+        print(f"    {why}")
+    for r, pr in s["legs"]:
+        print(f"    {r['play'][:22]:22} ML {fmt_am(pr):>5}  work {pct(r['work_p'], 0):>4}  mkt {pct(r['mk_p'], 0):>4}  "
+              f"KenPom {pct(r['kp_p'], 0):>4}  {et_time(r['commence'])[1]:>8} ET  "
+              f"[event {r['event_id']}] {','.join(r['flags'])}")
+
+
+def cmd_build(a):
+    rows = json.load(open(a.board))
+    books = [b.strip() for b in a.books.split(",") if b.strip()]
+    lo = _hhmm(a.tip_from) if a.tip_from else None
+    hi = _hhmm(a.tip_to) if a.tip_to else None
+    skip = [x.strip().lower() for x in (a.exclude or "").split(",") if x.strip()]
+    pool = []
+    for r in rows:
+        if r.get("live"):
+            continue
+        mins = et_time(r.get("commence"))[0]
+        if lo is not None and (mins is None or mins < lo):
+            continue
+        if hi is not None and (mins is None or mins > hi):
+            continue
+        if any(x in r["game"].lower() for x in skip):
+            continue
+        pool.append(r)
+    boost = a.boost / 100
+    promo = bool(a.min_odds or a.boost)
+    # A promo minimum such as +400 cannot be reached with three 60% legs (three -160s make about +330),
+    # so promo slips get a 55% bar and up to four legs. Everything else keeps 60% and three.
+    relaxed = bool(a.min_odds and (a.boost or a.bonus))
+    if a.min_prob is None:
+        a.min_prob = 0.55 if relaxed else 0.60
+    if a.max_legs is None:
+        a.max_legs = 4 if relaxed else 3
+    print(f"Slip builder  |  {len(pool)} games in the window  |  books: {','.join(books)}  |  "
+          f"legs {a.min_legs}-{a.max_legs}  |  leg bar {a.min_prob:.0%}"
+          + (f"  |  minimum {a.min_odds}" if a.min_odds else "") + (f"  |  boost {a.boost:g}%" if a.boost else "")
+          + ("  |  bonus bet" if a.bonus else ""))
+    n = 0
+    if not a.override_only:
+        slips = find_slips(pool, books, a.min_legs, a.max_legs, a.min_prob, a.min_odds, boost, a.stake, a.bonus,
+                           a.top, a.allow_overlap, worst_leg=a.worst_leg)
+        for s in slips:
+            n += 1
+            print_slip(n, s, "BONUS" if a.bonus else ("EDGE" if s["mev"] >= 0 else "FAIR"), a.stake, boost, a.bonus)
+    if n == 0:
+        if not a.override_only:
+            print("\nNo slip inside the rules meets this promo. Two options follow.")
+        if promo and not a.override_only:
+            alt = find_slips(pool, books, 2, 3, a.min_prob, "+100", 0.0, a.stake, False, 1, True, worst_leg=a.worst_leg)
+            for s in alt:
+                n += 1
+                print_slip(n, s, "EDGE" if s["mev"] >= 0 else "FAIR", a.stake, 0.0, False,
+                           "Best slip inside the rules, without the promo.")
+        ov = find_slips(pool, books, a.min_legs, max(a.max_legs, 4), 0.45, a.min_odds, boost,
+                        a.stake, a.bonus, 1, True, worst_leg=a.worst_leg)
+        for s in ov:
+            n += 1
+            broken = []
+            weak = [r["play"] for r, _ in s["legs"] if r["work_p"] < a.min_prob]
+            if weak:
+                broken.append("leg under the bar: " + ", ".join(weak))
+            if len(s["legs"]) > a.max_legs:
+                broken.append(f"{len(s['legs'])} legs")
+            print_slip(n, s, "OVERRIDE", a.stake, boost, a.bonus,
+                       "Meets the promo by breaking a rule (" + "; ".join(broken or ["relaxed search"]) + "). "
+                       "Only if Dustin asks for it.")
+    if n == 0:
+        print("\nNothing can be built from this window. Widen the tip window or add books.")
+    print("\nEDGE = clears break-even at the market's own probabilities, so it does not depend on KenPom being "
+          "right. FAIR = a sound slip at a fair price, no edge. OVERRIDE = breaks a rule to meet the promo. "
+          "Chance to cash treats legs as independent. "
+          "Flags to act on before recommending: B2B, SITE?, NEUTRAL, KP-, KP-VS-MKT. Movement and "
+          "availability are not checked here.")
 
 
 # ------------------------------------------------------------ ladder command
@@ -647,7 +864,8 @@ def cmd_parlay(a):
 
 LEDGER_COLS = ["ticket_id", "date", "book", "ticket_type", "stake", "ticket_odds", "boost_pct", "bonus_bet",
                "ticket_result", "payout", "profit", "leg_no", "event_id", "game", "market", "selection",
-               "line", "leg_odds", "est_prob", "tier", "kp_edge", "closing_odds", "leg_result", "notes"]
+               "line", "leg_odds", "est_prob", "tier", "kp_edge", "closing_odds", "leg_result", "notes", "label"]
+LABELS = ("edge", "fair", "override", "bonus", "")
 MARKETS = ("ml", "spread", "total", "points", "rebounds", "assists", "threes", "combo", "other")
 
 
@@ -694,6 +912,9 @@ def cmd_log(a):
     for k, v in by_id.items():
         if sig(v[0]["date"], v[0]["book"], [(r["selection"], r["leg_odds"]) for r in v]) == new_sig and not a.force:
             sys.exit(f"ERROR: this ticket is already logged as #{k}. Pass --force to log it again.")
+    label = str(t.get("label", "")).lower()
+    if label not in LABELS:
+        sys.exit(f"ERROR: label must be one of edge, fair, override, bonus (got {label!r})")
     ids = [int(r["ticket_id"]) for r in rows if r["ticket_id"].isdigit()]
     base = 1001 if ttype == "sgp" else 1
     same = [i for i in ids if (i >= 1001) == (ttype == "sgp")]
@@ -709,9 +930,12 @@ def cmd_log(a):
             ticket_result="pending", payout="", profit="", leg_no=i, event_id=l.get("event_id", ""),
             game=l.get("game", ""), market=l["market"], selection=l["selection"], line=l.get("line", ""),
             leg_odds=fmt_am(parse_american(l["odds"])), est_prob=l.get("est", ""), tier=l.get("tier", ""),
-            kp_edge=l.get("kp_edge", ""), closing_odds="", leg_result="pending", notes=l.get("notes", "")))
+            kp_edge=l.get("kp_edge", ""), closing_odds="", leg_result="pending", notes=l.get("notes", ""),
+            label=label))
     out = write_ledger(a.ledger, rows)
-    print(f"Logged ticket #{tid} ({ttype}, {len(legs)} leg{'s' if len(legs) > 1 else ''}, "
+    if not label:
+        print("NOTE: no label given. Add \"label\": \"edge\", \"fair\" or \"override\" so the audit can separate them.")
+    print(f"Logged ticket #{tid} ({ttype}{', ' + label if label else ''}, {len(legs)} leg{'s' if len(legs) > 1 else ''}, "
           f"${t['stake']} at {fmt_am(odds)}) -> {out}")
 
 
@@ -744,6 +968,11 @@ def cmd_settle(a):
         profit = a.payout - (0 if bonus else stake)
         result = "CASHOUT" if a.cashout else result
     payout = profit + (0 if bonus else stake) if result != "L" else 0.0
+    if a.label is not None:
+        if a.label.lower() not in LABELS:
+            sys.exit("ERROR: --label must be edge, fair, override or bonus")
+        for r in mine:
+            r["label"] = a.label.lower()
     for r, x, c in zip(mine, res, closing):
         r.update(leg_result=x, ticket_result=result, payout=f"{payout:.2f}", profit=f"{profit:.2f}")
         if c:
@@ -777,6 +1006,14 @@ def cmd_audit(a):
                 w = sum(1 for x in v if float(x[0]["profit"] or 0) > 0)
                 pr = sum(float(x[0]["profit"] or 0) for x in v)
                 print(f"  {tt:7} {w}/{len(v)} cashed   profit ${pr:+.2f}")
+        labs = sorted({(x[0].get("label") or "unlabeled") for x in done.values()})
+        if labs != ["unlabeled"]:
+            print("\nBy label (EDGE and FAIR are the copilot's slips; OVERRIDE are slips Dustin asked for against a rule):")
+            for lb in labs:
+                v = [x for x in done.values() if (x[0].get("label") or "unlabeled") == lb]
+                w = sum(1 for x in v if float(x[0]["profit"] or 0) > 0)
+                pr = sum(float(x[0]["profit"] or 0) for x in v)
+                print(f"  {lb:9} {w}/{len(v)} cashed   profit ${pr:+.2f}")
     legs = [r for r in rows if r["leg_result"] in ("W", "L")]
     if legs:
         print(f"\nLegs by market (W-L, hit rate vs the average break-even price and the average estimate):")
@@ -859,6 +1096,34 @@ def cmd_selftest(_):
                                  tempo=70)], [ev])
     check("board: prices read by side when a book adds the mascot",
           not un and rows[0]["ml_books"] == 2 and rows[0]["best_ml"] == (-220, "fanduel") and rows[0]["mk_spread"] == -5.5)
+    check("work: KenPom can lift the market by 2 points at most", abs(working_prob(0.73, 0.61, 0.35) - 0.63) < 1e-9
+          and abs(working_prob(0.50, 0.70, 0.5) - 0.67) < 1e-9)
+    ev2 = dict(id="2", home_team="Oakland", away_team="Northern Iowa", live=False, commence_time="2026-11-14T22:00:00Z",
+               bookmakers=[dict(key="fanduel", markets=[dict(key="h2h", line_type="main", outcomes=[
+                   dict(name="Oakland", price=-120, side="home"), dict(name="Northern Iowa", price=100, side="away")])])])
+    g2 = dict(away="Northern Iowa", home="Oakland", winner="Northern Iowa", sw=74, sl=72, p=0.58, neutral=False, tempo=68)
+    rows2, _ = build_board([g2], [ev2], kp_weight=0.35, played_yesterday={norm_team("Northern Iowa")})
+    check("board: KenPom pick that the market has as the underdog is flagged, with rest",
+          rows2[0]["play"] == "Northern Iowa" and rows2[0]["work_p"] < 0.5 and "KP-VS-MKT" in rows2[0]["flags"]
+          and "B2B" in rows2[0]["flags"])
+    ev3 = dict(id="3", home_team="Siena", away_team="Brown", live=False, bookmakers=[dict(key="fanduel", markets=[
+        dict(key="h2h", line_type="main", outcomes=[dict(name="Siena", price=-250, side="home"),
+                                                    dict(name="Brown", price=200, side="away")])])])
+    rows4, _ = build_board([dict(away="Brown", home="Siena", winner="Brown", sw=70, sl=69, p=0.51, neutral=False,
+                                 tempo=66)], [ev3], kp_weight=0.35)
+    check("board: plays the market favorite when KenPom barely leans the other way",
+          rows4[0]["play"] == "Siena" and abs(rows4[0]["work_p"] - (rows4[0]["mk_p"] - 0.03)) < 1e-9
+          and "KP-VS-MKT" in rows4[0]["flags"])
+    ev["commence_time"] = "2026-11-14T20:30:00Z"
+    rows3, _ = build_board([dict(away="LSU", home="Gonzaga", winner="Gonzaga", sw=82, sl=75, p=0.73, neutral=False,
+                                 tempo=70), g2], [ev, ev2], kp_weight=0.35)
+    rows3 = json.loads(json.dumps(rows3, default=str))
+    sl = find_slips(rows3, ["fanduel"], 2, 3, 0.45, None, 0.0, 5.0, False, 3, False)
+    check("build: finds the two-leg FanDuel slip and prices it", len(sl) == 1 and len(sl[0]["legs"]) == 2
+          and abs(sl[0]["dec"] - dec(-220) * dec(100)) < 1e-9)
+    check("build: 60% bar keeps the coin flip out", not find_slips(rows3, ["fanduel"], 2, 3, 0.60, None, 0.0, 5.0,
+                                                                   False, 3, False))
+    check("time: 20:30 UTC in November is 3:30 PM Eastern", et_time("2026-11-14T20:30:00Z") == (930, "3:30 PM"))
     check("players: 'Dixon, Derek' = 'Derek Dixon'", same_player("Dixon, Derek", "Derek Dixon"))
     check("players: Neo = Neoklis Avdalas (UNC)", same_player("Neo Avdalas", "Neoklis Avdalas (UNC)"))
     k, n, imp, est = rung_estimate([6, 7, 7], 6, -230)
@@ -882,10 +1147,32 @@ def main():
     s.add_argument("--books", default=BETTABLE)
     s.add_argument("--kp-weight", type=float, default=0.5, help="KenPom share of the blended probability")
     s.add_argument("--min-edge", type=float, default=None, help="only show games with at least this edge (pts)")
+    s.add_argument("--min-work", type=float, default=None, help="only show plays at or above this working probability (percent)")
+    s.add_argument("--prev-fanmatch", help="yesterday's FanMatch text, to flag teams on a second game in two days")
     s.add_argument("--alias", action="append", help="'KenPom name=PropLine name' (repeatable)")
     s.add_argument("--json", help="also save the board as JSON")
     s.add_argument("--include-live", action="store_true", help="also list games already in progress")
     s.set_defaults(fn=cmd_slate)
+
+    bd = sub.add_parser("build", help="best slips from a saved edge board, labeled EDGE / FAIR / OVERRIDE")
+    bd.add_argument("--board", required=True, help="JSON saved by: slate --json board.json")
+    bd.add_argument("--books", default=BETTABLE, help="books to build at; a book PropLine lacks uses reference prices")
+    bd.add_argument("--min-legs", type=int, default=2)
+    bd.add_argument("--max-legs", type=int, default=None, help="default 3, or 4 for a boost or bonus bet with a minimum")
+    bd.add_argument("--min-prob", type=float, default=None,
+                    help="bar for every leg: default 0.60, or 0.55 for a boost or bonus bet with a minimum")
+    bd.add_argument("--min-odds", help="promo minimum before the boost, e.g. +400")
+    bd.add_argument("--worst-leg", type=float, default=-400, help="shortest price allowed on a leg (default -400)")
+    bd.add_argument("--boost", type=float, default=0.0, help="profit boost percent")
+    bd.add_argument("--stake", type=float, default=5.0)
+    bd.add_argument("--bonus", action="store_true", help="bonus bet: stake not returned")
+    bd.add_argument("--tip-from", help="earliest tip, Eastern, 24h HH:MM")
+    bd.add_argument("--tip-to", help="latest tip, Eastern, 24h HH:MM")
+    bd.add_argument("--exclude", help="comma-separated team names to leave out (unexplained line move, injury doubt)")
+    bd.add_argument("--top", type=int, default=3, help="how many slips to return")
+    bd.add_argument("--allow-overlap", action="store_true", help="let slips share a game")
+    bd.add_argument("--override-only", action="store_true", help="show only the rule-breaking option")
+    bd.set_defaults(fn=cmd_build)
 
     l = sub.add_parser("ladder", help="overs-only alt-line board for one game")
     l.add_argument("--odds", required=True, help="saved propline_get_odds result for ONE event (player markets)")
@@ -927,6 +1214,7 @@ def main():
     t.add_argument("--closing", help="closing price per leg, comma-separated (blank allowed)")
     t.add_argument("--payout", type=float, help="actual amount returned (cashout or book rounding)")
     t.add_argument("--cashout", action="store_true")
+    t.add_argument("--label", help="set or correct the ticket's label: edge, fair, override or bonus")
     t.set_defaults(fn=cmd_settle)
 
     u = sub.add_parser("audit", help="record, ROI, calibration, CLV and leaks from the ledger")
@@ -938,7 +1226,8 @@ def main():
 
     # A value such as "-155:0.61:NKU" starts with a dash, and argparse would read it as an option.
     # Join each of these flags to its value so any odds or line is accepted as written.
-    joined = {"--leg", "--book", "--min-odds", "--closing", "--legs", "--spread", "--hist", "--alias", "--ticket"}
+    joined = {"--leg", "--book", "--min-odds", "--closing", "--legs", "--spread", "--hist", "--alias", "--ticket",
+              "--exclude", "--worst-leg"}
     argv, raw, i = [], sys.argv[1:], 0
     while i < len(raw):
         if raw[i] in joined and i + 1 < len(raw):

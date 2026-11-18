@@ -27,7 +27,7 @@ import statistics
 import sys
 from statistics import NormalDist
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 ND = NormalDist()
 BETTABLE = "draftkings,fanduel,betmgm,betonlineag"
 
@@ -727,19 +727,58 @@ def rung_estimate(vals, need, price, novig=None, prior_games=6.0, vig=0.06):
     return k, n, imp, est
 
 
+def market_q(price, novig=None, vig=0.06):
+    """The market's own probability for a rung: the no-vig number on a two-way line, else implied / (1 + vig)."""
+    return novig if novig is not None else implied(price) / (1 + vig)
+
+
+def opp_adjust(vals, ranks, tonight, opp_top=50, comp_top=100):
+    """Opponent-quality rule (2.2). Against a top opponent, soft-schedule games do not count.
+
+    Returns (games to score, mode). mode is None when the rule does not apply, "OPP-ADJ" when the hit rate
+    uses only games against comparable opponents, and "OPP-CAP" when there are fewer than two such games,
+    in which case the caller holds the estimate to the market's probability plus a small cap."""
+    if not ranks or tonight is None or tonight > opp_top:
+        return list(vals), None
+    comp = [v for v, r in zip(vals, ranks) if r <= comp_top]
+    if len(comp) >= 2:
+        return comp, "OPP-ADJ"
+    return list(vals), "OPP-CAP"
+
+
+def parse_hist(h):
+    """'Player:stat:v1,v2[@r1,r2[@tonight]]' -> (player, stat, vals, ranks or None, tonight or None).
+
+    r1,r2 are the KenPom ranks of the opponents in those games (NR for a non-D-I team); tonight is the KenPom
+    rank of tonight's opponent."""
+    player, stat, rest = h.rsplit(":", 2)
+    parts = rest.split("@")
+    if len(parts) > 3:
+        raise ValueError(h)
+    vals = [float(v) for v in parts[0].split(",") if v.strip() != ""]
+    rk = lambda x: 999 if x.strip().upper() == "NR" else int(x)
+    ranks = [rk(x) for x in parts[1].split(",") if x.strip() != ""] if len(parts) > 1 else None
+    tonight = rk(parts[2]) if len(parts) > 2 and parts[2].strip() else None
+    if ranks is not None and len(ranks) != len(vals):
+        raise ValueError(f"{h}: {len(vals)} games but {len(ranks)} opponent ranks")
+    return player.strip(), stat.strip().lower(), vals, ranks, tonight
+
+
 def cmd_ladder(a):
     ev = load_json(a.odds)
     if isinstance(ev, list):
         ev = ev[0]
     books = [b.strip() for b in a.books.split(",") if b.strip()]
     rungs = collect_rungs(ev, books)
-    hist = {}
+    hist, opp = {}, {}
     for h in a.hist or []:
         try:
-            player, stat, vals = h.rsplit(":", 2)
-            hist[(player.strip(), stat.strip().lower())] = [float(v) for v in vals.split(",") if v.strip() != ""]
-        except ValueError:
-            sys.exit(f"ERROR: --hist must look like 'James Scott:rebounds:6,7,7' (got {h!r})")
+            player, stat, vals, ranks, tonight = parse_hist(h)
+            hist[(player, stat)] = vals
+            opp[(player, stat)] = (ranks, tonight)
+        except ValueError as e:
+            sys.exit("ERROR: --hist must look like 'James Scott:rebounds:6,7,7' or, with opponent KenPom ranks "
+                     f"and tonight's opponent rank, 'James Scott:rebounds:6,7,7@210,45,12@8' (got {h!r}: {e})")
     print(f"Overs-only ladder  |  {ev.get('away_team')} @ {ev.get('home_team')}  |  books: {','.join(books)}  "
           f"|  rungs found: {len(rungs)}")
     if not rungs:
@@ -765,10 +804,16 @@ def cmd_ladder(a):
             if r[2] not in best or dec(r[3]) > dec(best[r[2]][3]):
                 best[r[2]] = r
         pick, scored = None, []
+        ranks, tonight = opp.get((hp, hs), (None, None))
+        vals, mode = opp_adjust(vals, ranks, tonight, a.opp_top, a.comp_top)
         for need in sorted(best):
             p, s, n_, pr, b, lt, nv = best[need]
             k, n, imp, est = rung_estimate(vals, need, pr, nv, a.prior_games, a.vig)
             flags = []
+            if mode == "OPP-CAP":
+                est = min(est, market_q(pr, nv, a.vig) + a.opp_cap)
+            if mode:
+                flags.append(mode)
             if pr < -400:
                 flags.append("CHALK")
             if n < 5:
@@ -791,7 +836,10 @@ def cmd_ladder(a):
                   f"est >= {a.min_est:.0%}, cushion)")
     print("\nHit = games at or above the rung. Est = hit rate shrunk toward the market price "
           f"(prior worth {a.prior_games:g} games). Edge = Est minus the price's implied probability. "
-          "PICK = highest rung that passes every test. THIN = under 5 games: cap at moderate confidence.")
+          "PICK = highest rung that passes every test. THIN = under 5 games: cap at moderate confidence. "
+          f"OPP-ADJ = tonight's opponent is KenPom top {a.opp_top}, so only games against top-{a.comp_top} "
+          f"opponents are counted. OPP-CAP = fewer than two such games, so Est is held to the market's "
+          f"probability plus {100 * a.opp_cap:g} points.")
 
 
 # ------------------------------------------------------- cover / parlay cmds
@@ -1128,6 +1176,17 @@ def cmd_selftest(_):
     check("players: Neo = Neoklis Avdalas (UNC)", same_player("Neo Avdalas", "Neoklis Avdalas (UNC)"))
     k, n, imp, est = rung_estimate([6, 7, 7], 6, -230)
     check("ladder: 3/3 at -230 shrinks to ~77%", k == 3 and abs(est - 0.772) < 0.01)
+    check("opp rule: one comparable game vs a top-50 opponent -> OPP-CAP on all games",
+          opp_adjust([16, 12, 6, 12], [332, 232, 5, 298], 6) == ([16, 12, 6, 12], "OPP-CAP"))
+    check("opp rule: two comparable games -> OPP-ADJ on those games only",
+          opp_adjust([10, 20, 15], [40, 80, 300], 12) == ([10, 20], "OPP-ADJ"))
+    check("opp rule: opponent outside the top 50, or no ranks given -> unchanged",
+          opp_adjust([10, 20, 15], [40, 80, 300], 120)[1] is None and opp_adjust([10, 20], None, None)[1] is None)
+    check("opp rule: hist with ranks parses", parse_hist("Dame Sarr:points:16,12,6,12@332,NR,5,298@6")
+          == ("Dame Sarr", "points", [16.0, 12.0, 6.0, 12.0], [332, 999, 5, 298], 6))
+    kk, nn, ii, ee = rung_estimate([16, 12, 6, 12], 11, -118, 0.517)
+    check("opp rule: capped estimate is market + 2 pts (51.7% -> 53.7%)",
+          abs(min(ee, market_q(-118, 0.517) + 0.02) - 0.537) < 1e-9 and ee > 0.60)
     r = price_parlay([(-115, .6, ""), (-230, .7, ""), (-275, .7, "")], book=230, boost=0.3, stake=5)
     check("parlay: tax 9.8%, boosted profit $14.95", abs(r["book_tax"] - 0.098) < 0.002 and abs(r["profit"] - 14.95) < 0.01)
     print("\nALL CHECKS PASSED" if ok else "\nSOME CHECKS FAILED")
@@ -1177,7 +1236,12 @@ def main():
     l = sub.add_parser("ladder", help="overs-only alt-line board for one game")
     l.add_argument("--odds", required=True, help="saved propline_get_odds result for ONE event (player markets)")
     l.add_argument("--books", default="draftkings")
-    l.add_argument("--hist", action="append", help="'Player:stat:v1,v2,...' oldest to newest (repeatable)")
+    l.add_argument("--hist", action="append",
+                   help="'Player:stat:v1,v2,...' oldest to newest (repeatable). Add '@r1,r2,...' for the KenPom rank of "
+                        "each game's opponent and '@N' for tonight's opponent rank, e.g. 'Dame Sarr:points:16,12,6,12@332,232,5,298@6'")
+    l.add_argument("--opp-top", type=int, default=50, help="opponent-quality rule applies when tonight's opponent is ranked this or better")
+    l.add_argument("--comp-top", type=int, default=100, help="games against opponents ranked this or better count as comparable")
+    l.add_argument("--opp-cap", type=float, default=0.02, help="with fewer than two comparable games, Est is capped at market + this")
     l.add_argument("--prior-games", type=float, default=6.0)
     l.add_argument("--vig", type=float, default=0.06)
     l.add_argument("--min-est", type=float, default=0.60)

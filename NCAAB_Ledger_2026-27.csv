@@ -1,0 +1,16 @@
+ticket_id,date,book,ticket_type,stake,ticket_odds,boost_pct,bonus_bet,ticket_result,payout,profit,leg_no,event_id,game,market,selection,line,leg_odds,est_prob,tier,kp_edge,closing_odds,leg_result,notes,label
+1,2026-11-17,caesars,parlay,10,+126,100,N,L,0.00,-10.00,1,737074,Green Bay @ West Florida,ml,Green Bay,,-220,0.676,moderate,5.3,-220,L,Caesars 100% boost; pays $35.26,edge
+1,2026-11-17,caesars,parlay,10,+126,100,N,L,0.00,-10.00,2,737118,FIU @ UAB,ml,UAB,,-180,0.637,moderate,6.3,-184,W,,edge
+2,2026-11-17,fanduel,parlay,10,+124,30,N,W,26.22,16.22,1,738107,Seattle @ Cal Baptist,ml,Seattle,,-360,0.73,strong,-3.0,-360,W,"FanDuel 30% 3+ leg boost; boosted +162, pays $26.22; est cut 2 pts for short rest",edge
+2,2026-11-17,fanduel,parlay,10,+124,30,N,W,26.22,16.22,2,738119,UC Irvine @ Stanford,ml,Stanford,,-275,0.726,strong,0.7,-275,W,,edge
+2,2026-11-17,fanduel,parlay,10,+124,30,N,W,26.22,16.22,3,737117,Le Moyne @ Evansville,ml,Evansville,,-345,0.718,strong,-7.4,-295,W,,edge
+1001,2026-11-17,fanduel,sgp,7.31,+196,30,N,L,0.00,-7.31,1,737063,Illinois @ Duke,points,Dame Sarr Over 10.5,10.5,-115,0.602,moderate,,-115,L,FanDuel 30% Illinois @ Duke boost; boosted +254; placed 6:59 PM; leg prices as quoted 6:53 PM,fair
+1001,2026-11-17,fanduel,sgp,7.31,+196,30,N,L,0.00,-7.31,2,737063,Illinois @ Duke,points,Andrej Stojakovic Over 18.5,18.5,-128,0.617,moderate,,-128,W,,fair
+3,2026-11-20,betmgm,parlay,7.31,+435,20,N,L,0.00,-7.31,1,836269,Tulsa vs Mississippi St.,ml,Mississippi St.,,-300,0.738,strong,3.3,-305,W,"BetMGM 20% College Basketball parlay token; boosted +522, pays $45.49; placed about 6:52 PM; closing prices are DraftKings",fair
+3,2026-11-20,betmgm,parlay,7.31,+435,20,N,L,0.00,-7.31,2,836271,Iowa @ Xavier,ml,Xavier,,-170,0.6,moderate,4.6,-170,L,est cut 2 pts: weak schedule and pace,fair
+3,2026-11-20,betmgm,parlay,7.31,+435,20,N,L,0.00,-7.31,3,836270,UT Arlington @ Northwestern St.,ml,UT Arlington,,-180,0.616,moderate,0.7,-175,W,,fair
+3,2026-11-20,betmgm,parlay,7.31,+435,20,N,L,0.00,-7.31,4,836260,Kentucky vs Indiana,ml,Indiana,,-160,0.584,coin-flip,-3.7,-162,W,,fair
+1002,2026-11-20,draftkings,sgp,7.31,+410,25,N,W,44.81,37.50,1,836475,Marshall @ North Carolina,assists,Matt Able 2+,2,-150,0.64,moderate,,-150,W,"DraftKings 25% parlay boost; boosted +513, pays $44.81; placed 6:50 PM; leg prices as quoted 6:38 PM; props-only at Dustin request",override
+1002,2026-11-20,draftkings,sgp,7.31,+410,25,N,W,44.81,37.50,2,836475,Marshall @ North Carolina,threes,Matt Able 2+,2,-185,0.647,moderate,,-185,W,no cushion; est cut 2 pts: Marshall allows few 3PA,override
+1002,2026-11-20,draftkings,sgp,7.31,+410,25,N,W,44.81,37.50,3,836475,Marshall @ North Carolina,rebounds,Terrence Brown 3+,3,-295,0.723,moderate,,-295,W,,override
+1002,2026-11-20,draftkings,sgp,7.31,+410,25,N,W,44.81,37.50,4,836475,Marshall @ North Carolina,points,Terrence Brown 18+,18,-155,0.544,below 55,,-155,W,under the 55% bar,override
